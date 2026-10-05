@@ -8,10 +8,11 @@ from superlarynx.acoustic_graph import AcousticGraph
 from superlarynx.compiler import compile_graph_to_recipe
 from superlarynx.agents import AGENT_PROMPTS
 from superlarynx.ripwave import RipwaveField
+import os
 
 ripwave_field = RipwaveField()
 
-PORT = 8765
+PORT = int(os.environ.get("PORT", 8765))
 API = 'https://api.inceptionlabs.ai/v1/chat/completions'
 MODEL = 'mercury-2.5'
 UA = {'User-Agent': 'Mozilla/5.0 sound-engine'}
@@ -20,29 +21,6 @@ def http(url, data=None, headers=None, timeout=60):
     req = urllib.request.Request(url, data=data, headers=headers or {})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode('utf-8', 'replace')
-
-def clean(s):
-    return html.unescape(re.sub(r'<[^>]+>', '', s)).strip()
-
-def research(queries, fs):
-    out, errs = [], []
-    for q in queries[:2]:
-        try:
-            if fs:
-                u = 'https://freesound.org/apiv2/search/text/?' + urllib.parse.urlencode({
-                    'query': q, 'filter': 'duration:[0 TO 3]', 'page_size': 5, 'token': fs,
-                    'fields': 'name,description,tags,duration,license'})
-                for s in json.loads(http(u, headers=UA)).get('results', []):
-                    out.append({'src': 'freesound', 'name': s['name'], 'tags': s.get('tags', [])[:8],
-                                'dur': s.get('duration'), 'license': s.get('license'),
-                                'desc': (s.get('description') or '')[:200]})
-            else:
-                h = http('https://html.duckduckgo.com/html/?q=' + urllib.parse.quote(q + ' sound design'), headers=UA)
-                for t, sn in re.findall(r'class="result__a"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>', h, re.S)[:5]:
-                    out.append({'src': 'web', 'name': clean(t), 'desc': clean(sn)[:250]})
-        except Exception as e:
-            errs.append(str(e)[:100])
-    return {'results': out, 'errors': errs}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -64,21 +42,30 @@ class H(BaseHTTPRequestHandler):
             self.send(404, '{}')
 
     def do_POST(self):
-        d = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
-        if self.path == '/api/research':
-            return self.send(200, json.dumps(research(d.get('queries', []), d.get('freesound', ''))))
-        
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length) if length > 0 else b'{}'
+            d = json.loads(body)
+        except Exception:
+            d = {}
+
         if self.path == '/api/llm':
             payload = {'model': MODEL, 'messages': d['messages'], 'reasoning_effort': 'low',
                        'temperature': d.get('temperature', 0.6), 'max_completion_tokens': 4096}
+            connect_timeout = d.get('connect_timeout', 15000) / 1000.0
             try:
                 r = http(API, json.dumps(payload).encode(), {'Content-Type': 'application/json',
-                         'Authorization': 'Bearer ' + d.get('key', '')}, timeout=90)
+                         'Authorization': 'Bearer ' + d.get('key', '')}, timeout=connect_timeout)
                 return self.send(200, r)
             except urllib.error.HTTPError as e:
+                # pass upstream HTTP status to client for retry logic
                 return self.send(e.code, json.dumps({'error': e.read().decode('utf-8', 'replace')[:300]}))
             except Exception as e:
-                return self.send(502, json.dumps({'error': str(e)[:300]}))
+                # generic connection errors usually bubble up as 502
+                msg = str(e)
+                if "timed out" in msg.lower():
+                    msg = "CONNECT_TIMEOUT: " + msg
+                return self.send(502, json.dumps({'error': msg[:300]}))
                 
         if self.path == '/api/compile':
             try:
@@ -95,7 +82,6 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(routing))
             
         if self.path == '/api/ripwave/store':
-            # Minimal store implementation for feedback
             exp = Experience(user_intent=d.get("intent", ""))
             exp.outcome = d.get("outcome", "neutral")
             eval_data = d.get("evaluation", {})
@@ -103,8 +89,13 @@ class H(BaseHTTPRequestHandler):
                 user_preference=eval_data.get("preference", 0.0),
                 perceptual_similarity=eval_data.get("similarity", 0.5)
             )
+            
+            # Important: Distinguish infrastructure failure from acoustic failure
+            if d.get("infrastructure_error"):
+                # Do not feed infrastructure errors into Ripwave as negative experiences
+                return self.send(200, json.dumps({"status": "ignored_infra_error"}))
+
             ripwave_field.store_experience(exp)
-            # Run BREATHE occasionally
             breathe_report = ripwave_field.breathe_inspect()
             return self.send(200, json.dumps({"status": "ok", "breathe": breathe_report}))
 
@@ -123,7 +114,7 @@ textarea{min-height:60px;resize:vertical}label{font-size:12px;color:var(--mut);d
 button{background:linear-gradient(90deg,var(--b),#0a7a99);color:#fff;border:0;border-radius:8px;padding:9px 16px;font:inherit;cursor:pointer}
 button.g{background:#1c1c28;border:1px solid var(--line)}button:disabled{opacity:.5}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:0 0 auto}
-.st{font-size:13px;margin:4px 0}.st b{color:var(--a)}.st.err{color:#ff6b6b}
+.st{font-size:13px;margin:4px 0}.st b{color:var(--a)}.st.err{color:#ff6b6b}.st.warn{color:#ffb86c}
 details{font-size:12px;color:var(--mut);margin:2px 0; background: #0e0e15; padding: 6px; border-radius: 6px; border: 1px solid var(--line);}
 pre{white-space:pre-wrap;word-break:break-word;background:#0b0b10;padding:8px;border-radius:8px;max-height:220px;overflow:auto}
 canvas{width:100%;height:90px;background:#0e0e15;border-radius:8px;display:block}
@@ -133,17 +124,19 @@ summary{cursor:pointer; font-weight: bold; color: var(--a);}
 
 <div class="card">
 <label>Inception API key</label><input id="key" type="password" placeholder="paste key, then it is remembered locally">
-<details><summary>Settings</summary>
+<details><summary>Settings & Timeouts</summary>
 <label>SABLE Critic Iterations (max)</label><input id="iters" type="number" value="1" min="1" max="3">
-<label>Brand sonic profile</label>
-<textarea id="profile" placeholder="e.g. Calm fintech app..."></textarea>
+<label>Brand sonic profile</label><textarea id="profile" placeholder="e.g. Calm fintech app..."></textarea>
+<label>Connect Timeout (ms)</label><input id="LLM_CONNECT_TIMEOUT_MS" type="number" value="15000">
+<label>Read Timeout (ms)</label><input id="LLM_READ_TIMEOUT_MS" type="number" value="25000">
+<label>Stage Timeout (ms)</label><input id="LLM_STAGE_TIMEOUT_MS" type="number" value="60000">
 </details>
 </div>
 
 <div class="card">
 <label>What do you need?</label>
 <textarea id="prompt" placeholder="e.g. the sound of a marble hitting granite"></textarea>
-<div class="row" style="margin-top:10px"><button id="go">Generate</button><span id="msg" class="st"></span></div>
+<div class="row" style="margin-top:10px"><button id="go">Generate</button><button id="cancel" class="g" disabled>Cancel</button><span id="msg" class="st"></span></div>
 </div>
 
 <div id="log" class="card" style="display:none"></div>
@@ -175,23 +168,17 @@ function extractFeatures(buf) {
     rmsSq += d[i]*d[i];
     if(i>0 && ((d[i]>=0 && d[i-1]<0) || (d[i]<0 && d[i-1]>=0))) zcr++;
   }
-  return {
-    peak: peak,
-    rms: Math.sqrt(rmsSq/d.length),
-    zero_crossing_rate: zcr / (d.length / buf.sampleRate),
-    duration: buf.length / buf.sampleRate
-  };
+  return { peak: peak, rms: Math.sqrt(rmsSq/d.length), zero_crossing_rate: zcr / (d.length / buf.sampleRate), duration: buf.length / buf.sampleRate };
 }
 
 function impulse(ctx,dec){const n=Math.floor(ctx.sampleRate*dec),b=ctx.createBuffer(2,n,ctx.sampleRate);for(let c=0;c<2;c++){const d=b.getChannelData(c);for(let i=0;i<n;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/n,3);}return b;}
 async function render(rc){
-  if(!rc.layers) throw new Error("Invalid recipe");
+  if(!rc.layers) throw new Error("[ACOUSTIC] Invalid recipe");
  const SR=44100,end=Math.max(rc.duration,...rc.layers.map(l=>l.start+l.dur+l.r)),len=end+((rc.reverb&&rc.reverb.mix>0)?rc.reverb.decay:0.05);
  const ctx=new OfflineAudioContext(2,Math.ceil(SR*len),SR);
  const master=ctx.createGain();master.gain.value=0.8;master.connect(ctx.destination);
  const dry=ctx.createGain(),wet=ctx.createGain(),bus=ctx.createGain();
- const rMix = rc.reverb ? rc.reverb.mix : 0.0;
- const rDec = rc.reverb ? rc.reverb.decay : 0.5;
+ const rMix = rc.reverb ? rc.reverb.mix : 0.0, rDec = rc.reverb ? rc.reverb.decay : 0.5;
  dry.gain.value=1-rMix;wet.gain.value=rMix;
  dry.connect(master);if(rMix>0){const cv=ctx.createConvolver();cv.buffer=impulse(ctx,rDec);wet.connect(cv);cv.connect(master);}
  bus.connect(dry);bus.connect(wet);
@@ -216,85 +203,204 @@ function wav(buf){const n=buf.length,d=new DataView(new ArrayBuffer(44+n*4)),s=(
  let o=44;const L=buf.getChannelData(0),R=buf.getChannelData(1);for(let i=0;i<n;i++){d.setInt16(o,Math.max(-1,Math.min(1,L[i]))*32767,true);o+=2;d.setInt16(o,Math.max(-1,Math.min(1,R[i]))*32767,true);o+=2;}return new Blob([d],{type:'audio/wav'});}
 
 const $=id=>document.getElementById(id),LS=localStorage;
-['key','profile','iters'].forEach(i=>{$(i).value=LS.getItem('se_'+i)||($(i).value);$(i).addEventListener('input',()=>LS.setItem('se_'+i,$(i).value));});
+['key','profile','iters','LLM_CONNECT_TIMEOUT_MS','LLM_READ_TIMEOUT_MS','LLM_STAGE_TIMEOUT_MS'].forEach(i=>{
+  $(i).value=LS.getItem('se_'+i)||($(i).value);
+  $(i).addEventListener('input',()=>LS.setItem('se_'+i,$(i).value));
+});
 const AC=new(window.AudioContext||window.webkitAudioContext)();let cur=null,last={};
+let currentController = null;
 
-async function llm(agent,system,user,temp=0.6){
- const key=$('key').value.trim();if(!key)throw new Error('Paste your API key first');
- let m=[{role:'system',content:system},{role:'user',content:user}];
- for(let i=0;i<2;i++){const r=await fetch('/api/llm',{method:'POST',body:JSON.stringify({key,messages:m,temperature:temp})}),d=await r.json();
-  if(!r.ok)throw new Error(agent+': '+(typeof d.error==='string'?d.error:JSON.stringify(d.error||d)));
-  const t=d.choices[0].message.content;try{return parseJSON(t);}catch(e){m=m.concat([{role:'assistant',content:t},{role:'user',content:'Invalid JSON ('+e.message+'). Return ONLY the JSON object.'}]);}}
- throw new Error(agent+': no valid JSON after retry');}
+async function llm(agent, system, user, temp = 0.6) {
+  const key = $('key').value.trim();
+  if (!key) throw new Error('Paste your API key first');
 
-function show(name,obj,err){
- const l=$('log');l.style.display='block';let e=document.getElementById('st_'+name.replace(/\s+/g,'_'));
- if(!e){e=document.createElement('div');e.id='st_'+name.replace(/\s+/g,'_');l.appendChild(e);}
- e.className='st'+(err?' err':'');e.innerHTML='<b>'+name+'</b> '+(err?('failed: '+err):(obj?'done':'working...'))+(obj?'<details><summary>output</summary><pre></pre></details>':'');
- if(obj)e.querySelector('pre').textContent=JSON.stringify(obj,null,2);}
+  let m = [{ role: 'system', content: system }, { role: 'user', content: user }];
+  let attempts = 0;
+  const maxRetries = 3;
+  const connectMs = parseInt($('LLM_CONNECT_TIMEOUT_MS').value);
+  const readMs = parseInt($('LLM_READ_TIMEOUT_MS').value);
+  
+  while (attempts < maxRetries) {
+    attempts++;
+    const startTime = Date.now();
+    let timeoutCat = null, status = 0, elapsed = 0;
+    
+    // Explicit timeouts via AbortController
+    const controller = new AbortController();
+    if(currentController && currentController.signal.aborted) throw new Error("[INFRASTRUCTURE] Cancelled by user");
+    currentController = controller;
+    
+    const id = setTimeout(() => {
+      timeoutCat = "READ_TIMEOUT";
+      controller.abort();
+    }, readMs);
 
-async function stage(name,fn,soft){show(name);try{const o=await fn();show(name,o);return o;}catch(e){show(name,null,e.message);if(!soft)throw e;return null;}}
+    try {
+      const r = await fetch('/api/llm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, messages: m, temperature: temp, connect_timeout: connectMs }),
+        signal: controller.signal
+      });
+      clearTimeout(id);
+      
+      status = r.status;
+      elapsed = Date.now() - startTime;
+      
+      if (!r.ok) {
+        if ([502, 503, 504].includes(r.status)) {
+           console.warn("LLM Error", {stage: agent, start_time: startTime, status, elapsed, retried: true, error: 'upstream_error'});
+           await new Promise(res => setTimeout(res, 500 + Math.random() * 500 * Math.pow(2, attempts)));
+           continue;
+        }
+        const err = await r.json();
+        throw new Error(typeof err.error === 'string' ? err.error : JSON.stringify(err));
+      }
 
-async function feedback(preference) {
+      const d = await r.json();
+      const t = d.choices[0].message.content;
+      
+      // Structured diagnostics logging
+      console.log("LLM Diagnostic", {stage: agent, start_time: startTime, model: 'mercury-2.5', status, elapsed, retried: attempts>1});
+
+      try {
+        return parseJSON(t);
+      } catch (e) {
+        m = m.concat([
+          { role: 'assistant', content: t },
+          { role: 'user', content: 'Invalid JSON (' + e.message + '). Return ONLY the JSON object.' }
+        ]);
+        continue;
+      }
+    } catch (e) {
+      clearTimeout(id);
+      elapsed = Date.now() - startTime;
+      const errorName = e.name === "AbortError" ? timeoutCat||"CANCELLED" : e.message;
+      console.warn("LLM Diagnostic", {stage: agent, start_time: startTime, model: 'mercury-2.5', status, elapsed, retried: attempts < maxRetries, error: errorName});
+      
+      if (errorName === "CANCELLED") throw new Error("[INFRASTRUCTURE] Cancelled by user");
+
+      if (errorName === "READ_TIMEOUT" || e.message.includes("CONNECT_TIMEOUT")) {
+         if (attempts < maxRetries) {
+             await new Promise(res => setTimeout(res, 500 + Math.random() * 500 * Math.pow(2, attempts)));
+             continue;
+         }
+      }
+      throw new Error(`[INFRASTRUCTURE] ${agent} failed: ${errorName}`);
+    }
+  }
+  throw new Error(`[INFRASTRUCTURE] ${agent} failed after ${maxRetries} retries`);
+}
+
+function showStatus(name, state, detail='') {
+  const l = $('log'); l.style.display = 'block';
+  let id = 'st_' + name.replace(/\s+/g,'_');
+  let e = document.getElementById(id);
+  if(!e){ e = document.createElement('div'); e.id = id; l.appendChild(e); }
+  let cls = 'st';
+  let icon = '…';
+  if(state === 'success') { icon = '✓'; }
+  else if(state === 'error') { icon = '⚠'; cls += ' err'; }
+  else if(state === 'warn') { icon = '⚠'; cls += ' warn'; }
+  
+  e.className = cls;
+  let htmlStr = `<div style="display:flex; justify-content:space-between; width:250px;"><b>${name}</b><span>${icon} ${detail}</span></div>`;
+  e.innerHTML = htmlStr;
+}
+
+async function stage(name, fn) {
+  showStatus(name, 'running');
+  try {
+    const o = await fn();
+    showStatus(name, 'success');
+    return o;
+  } catch (e) {
+    const isInfra = e.message.includes("[INFRASTRUCTURE]");
+    showStatus(name, isInfra ? 'error' : 'warn', isInfra ? 'INFRA ERROR' : 'PIPELINE ERROR');
+    throw e;
+  }
+}
+
+async function feedback(preference, infraError=false) {
   await fetch('/api/ripwave/store', {
     method: 'POST', body: JSON.stringify({
-      intent: last.prompt, outcome: preference>0?"liked":"rejected", evaluation: {preference: preference}
+      intent: last.prompt, 
+      outcome: preference>0?"liked":"rejected", 
+      evaluation: {preference: preference},
+      infrastructure_error: infraError
     })
   });
 }
 
+$('cancel').onclick = () => {
+    if(currentController) currentController.abort("CANCELLED");
+};
+
 $('go').onclick=async()=>{
- const p=$('prompt').value.trim();if(!p)return;$('go').disabled=true;$('log').innerHTML='';$('msg').textContent='';
+ const p=$('prompt').value.trim();if(!p)return;
+ $('go').disabled=true; $('cancel').disabled=false;
+ $('log').innerHTML=''; $('msg').textContent='';
+ const overallStartTime = Date.now();
+ const stageTimeoutMs = parseInt($('LLM_STAGE_TIMEOUT_MS').value);
+
  try{
   const prof=$('profile').value||'(none)';
   
-  // 1. Refiner
-  const spec = await stage('Refiner', ()=>llm('refiner', P.refiner, 'BRAND PROFILE:\n'+prof+'\n\nUSER REQUEST:\n'+p));
+  // 1. Refiner (Nonessential - Degrade gracefully)
+  let spec = null;
+  try {
+    spec = await stage('REFINER', ()=>llm('refiner', P.refiner, 'BRAND PROFILE:\n'+prof+'\n\nUSER REQUEST:\n'+p));
+  } catch (e) {
+    if (e.message.includes("[INFRASTRUCTURE]")) {
+      spec = { raw_intent: p, event_type: "compound", feeling_word: "unknown", degraded: true, source: "user_prompt", confidence: "low" };
+      showStatus('FALLBACK', 'warn', 'RAW PROMPT');
+    } else {
+      throw e;
+    }
+  }
   
-  // 2. Ripwave Routing
-  const route = await stage('Ripwave Routing', async()=>{
-    const r=await fetch('/api/ripwave/route', {method:'POST', body:JSON.stringify({context: p})});
-    return await r.json();
-  }, true);
-
-  // 3. Storyteller
-  const storyIn = JSON.stringify({perceptual_specification: spec, brand_profile: prof, ripwave_hints: route});
-  const hyp = await stage('Storyteller', ()=>llm('storyteller', P.storyteller, storyIn));
+  // 2. Storyteller
+  const storyIn = JSON.stringify({perceptual_specification: spec, brand_profile: prof}); // Keeping context lean
+  const hyp = await stage('STORYTELLER', ()=>llm('storyteller', P.storyteller, storyIn));
   $('hypothesis').textContent = JSON.stringify(hyp, null, 2);
 
   let iters = parseInt($('iters').value) || 1;
-  let current_graph = null;
-  let critique = null;
+  let current_graph = null, critique = null;
   
   for(let i=0; i<iters; i++) {
+    if (Date.now() - overallStartTime > stageTimeoutMs) {
+       showStatus('BUDGET', 'warn', 'TIME EXCEEDED');
+       break; // Stop gracefully and use best realization
+    }
+
     // 4. Designer / Compiler
     const designIn = JSON.stringify({causal_hypothesis: hyp, previous_critique: critique});
-    const designOut = await stage('Designer (Iter '+(i+1)+')', ()=>llm('designer', P.designer, designIn));
+    const designOut = await stage('GRAPH', ()=>llm('designer', P.designer, designIn));
     
     // 5. Python Compilation
     current_graph = designOut.graph;
-    const recipe = await stage('Acoustic Compiler (Iter '+(i+1)+')', async()=>{
+    const recipe = await stage('COMPILER', async()=>{
       const r = await fetch('/api/compile', {method:'POST', body:JSON.stringify({graph: current_graph})});
-      if(!r.ok) throw new Error(await r.text());
+      if(!r.ok) throw new Error("[PIPELINE] Compiler failed: "+await r.text());
       return await r.json();
     });
     
     // 6. Render
-    cur = await render(recipe);
+    cur = await stage('RENDER', async() => await render(recipe));
     
     // 7. Perceptual Analysis
     const feats = extractFeatures(cur);
     $('features_out').textContent = JSON.stringify(feats, null, 2);
     
     // 8. SABLE Critic
-    const sableIn = JSON.stringify({
-      target_spec: spec, generated_features: feats, causal_hypothesis: hyp
-    });
-    critique = await stage('SABLE Critic (Iter '+(i+1)+')', ()=>llm('sable', P.sable, sableIn));
+    const sableIn = JSON.stringify({ target_spec: spec, generated_features: feats, causal_hypothesis: hyp });
+    critique = await stage('SABLE', ()=>llm('sable', P.sable, sableIn));
     $('sable_out').textContent = JSON.stringify(critique, null, 2);
     
     if(critique.accept) break;
   }
+  
+  if(!current_graph) throw new Error("[PIPELINE] No valid graph generated before timeout.");
   
   $('graph_out').textContent = JSON.stringify(current_graph, null, 2);
   last = {prompt: p, spec: spec};
@@ -303,8 +409,16 @@ $('go').onclick=async()=>{
   const cv=$('cv'),g=cv.getContext('2d'),d=cur.getChannelData(0);g.clearRect(0,0,800,90);g.strokeStyle='#00d9ff';g.beginPath();
   for(let x=0;x<800;x++){const s=Math.floor(x/800*d.length);let mx=0;for(let j=s;j<Math.min(d.length,s+Math.ceil(d.length/800));j++)mx=Math.max(mx,Math.abs(d[j]));g.moveTo(x,45-mx*42);g.lineTo(x,45+mx*42);}g.stroke();
   play(cur);
- }catch(e){$('msg').className='st err';$('msg').textContent=e.message; console.error(e);}
+ }catch(e){
+  $('msg').className='st err';
+  $('msg').textContent=e.message;
+  console.error(e);
+  if(e.message.includes("[INFRASTRUCTURE]")) {
+     feedback(0, true); // Don't feed infra errors into Ripwave
+  }
+ }
  $('go').disabled=false;
+ $('cancel').disabled=true;
 };
 
 function play(b){AC.resume();const s=AC.createBufferSource();s.buffer=b;s.connect(AC.destination);s.start();}

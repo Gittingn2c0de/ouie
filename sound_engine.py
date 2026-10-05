@@ -71,6 +71,15 @@ class H(BaseHTTPRequestHandler):
             try:
                 graph_dict = d.get('graph', {})
                 seed_val = d.get('seed', 42)
+                
+                # Pre-flight validation
+                validation_errors = AcousticGraph.validate_dict(graph_dict)
+                if validation_errors:
+                    return self.send(400, json.dumps({
+                        'error': 'GRAPH_VALIDATION_ERROR',
+                        'details': validation_errors
+                    }))
+
                 graph = AcousticGraph.from_dict(graph_dict)
                 recipe = compile_graph_to_recipe(graph, Seed(value=seed_val))
                 return self.send(200, json.dumps(recipe))

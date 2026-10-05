@@ -49,12 +49,13 @@ class NodeType(Enum):
 
 class EdgeType(Enum):
     """Connection types between nodes."""
-    CAUSALITY = "causality"             # A causes B
-    ENERGY_TRANSFER = "energy_transfer" # Energy flows from A to B
-    MODULATION = "modulation"           # A modulates B
+    CAUSALITY = "causality"             # A causes B or enables B
+    ENERGY_TRANSFER = "energy_transfer" # Energy flows from A into B
+    INTERACTION = "interaction"         # A physically interacts with B
+    MODULATION = "modulation"           # A modulates a parameter/state of B
     CONTAINMENT = "containment"         # A contains B
-    PROPAGATION = "propagation"         # Signal propagates through A to B
-    RESONANCE = "resonance"             # A excites resonance in B
+    PROPAGATION = "propagation"         # Acoustic/physical energy travels through A to B
+    RESONANCE = "resonance"             # A excites or couples into B's resonant behavior
     TEMPORAL = "temporal"               # A precedes B in time
 
 
@@ -225,11 +226,45 @@ class AcousticGraph:
         }
 
     @classmethod
+    def validate_dict(cls, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Validate graph schema before compilation."""
+        errors = []
+        
+        # Check nodes
+        valid_nodes = {n.value for n in NodeType}
+        for nd in data.get("nodes", []):
+            if nd.get("type") not in valid_nodes:
+                errors.append({
+                    "type": "GRAPH_VALIDATION_ERROR",
+                    "reason": "Invalid NodeType",
+                    "node_id": nd.get("id"),
+                    "invalid_type": nd.get("type"),
+                })
+
+        # Check edges
+        valid_edges = {e.value for e in EdgeType}
+        for ed in data.get("edges", []):
+            edge_type_val = ed.get("type", "causality")
+            if edge_type_val not in valid_edges:
+                errors.append({
+                    "type": "GRAPH_VALIDATION_ERROR",
+                    "reason": "EdgeType is not registered",
+                    "edge": {
+                        "source": ed.get("source"),
+                        "target": ed.get("target"),
+                        "type": edge_type_val
+                    },
+                    "producer": "Storyteller -> Causal Hypothesis -> Graph Builder"
+                })
+        return errors
+
+    @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AcousticGraph":
         """Reconstruct a graph from its serialized form."""
         graph = cls(
             graph_id=data.get("graph_id", ""),
             physics_mode=PhysicsMode(data.get("physics_mode", "plausible")),
+            metadata=data.get("metadata", {})
         )
         for nd in data.get("nodes", []):
             node = GraphNode(
@@ -242,6 +277,12 @@ class AcousticGraph:
                 parameters=nd.get("parameters", {}),
                 dsp_params=nd.get("dsp_params", {}),
             )
+            # Hydrate material if present (assuming material is passed in params for now, 
+            # though schema says it might be under 'material')
+            if "material" in nd and nd["material"]:
+                from .models import MaterialState
+                node.material = MaterialState(**nd["material"])
+                
             graph.nodes[node.node_id] = node
         for ed in data.get("edges", []):
             edge = GraphEdge(

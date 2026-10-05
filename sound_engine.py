@@ -393,7 +393,7 @@ $('go').onclick=async()=>{
     $('features_out').textContent = JSON.stringify(feats, null, 2);
     
     // 8. SABLE Critic
-    const sableIn = JSON.stringify({ target_spec: spec, generated_features: feats, causal_hypothesis: hyp });
+    const sableIn = JSON.stringify({ target_spec: spec, generated_features: feats, causal_hypothesis: hyp, compiler_trace: recipe.compiler_trace });
     critique = await stage('SABLE', ()=>llm('sable', P.sable, sableIn));
     $('sable_out').textContent = JSON.stringify(critique, null, 2);
     

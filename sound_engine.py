@@ -49,24 +49,43 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             d = {}
 
+        if self.path == '/api/test_timeout':
+            import time
+            delay_type = d.get('type', 'read_timeout')
+            if delay_type == 'read_timeout':
+                time.sleep(2)
+                return self.send(502, json.dumps({'error': 'READ_TIMEOUT: simulated'}))
+            elif delay_type == '502':
+                return self.send(502, json.dumps({'error': 'Bad Gateway'}))
+            return self.send(200, json.dumps({"test": "ok"}))
+
         if self.path == '/api/llm':
             payload = {'model': MODEL, 'messages': d['messages'], 'reasoning_effort': 'low',
                        'temperature': d.get('temperature', 0.6), 'max_completion_tokens': 4096}
             connect_timeout = d.get('connect_timeout', 15000) / 1000.0
+            read_timeout = d.get('read_timeout', 25000) / 1000.0
+            stage_name = d.get('stage_name', 'unknown')
+            import time
+            start_time = time.time()
             try:
                 r = http(API, json.dumps(payload).encode(), {'Content-Type': 'application/json',
-                         'Authorization': 'Bearer ' + d.get('key', '')}, timeout=connect_timeout)
+                         'Authorization': 'Bearer ' + d.get('key', '')}, timeout=connect_timeout + read_timeout)
+                print(f"[{stage_name}] HTTP 200, dur: {time.time() - start_time:.2f}s")
                 return self.send(200, r)
             except urllib.error.HTTPError as e:
-                # pass upstream HTTP status to client for retry logic
+                print(f"[{stage_name}] HTTP {e.code}, dur: {time.time() - start_time:.2f}s")
                 return self.send(e.code, json.dumps({'error': e.read().decode('utf-8', 'replace')[:300]}))
             except Exception as e:
-                # generic connection errors usually bubble up as 502
                 msg = str(e)
+                dur = time.time() - start_time
+                print(f"[{stage_name}] Exception: {msg}, dur: {dur:.2f}s")
                 if "timed out" in msg.lower():
-                    msg = "CONNECT_TIMEOUT: " + msg
+                    if dur > connect_timeout:
+                        msg = "READ_TIMEOUT: " + msg
+                    else:
+                        msg = "CONNECT_TIMEOUT: " + msg
                 return self.send(502, json.dumps({'error': msg[:300]}))
-                
+
         if self.path == '/api/compile':
             try:
                 graph_dict = d.get('graph', {})
@@ -151,6 +170,7 @@ summary{cursor:pointer; font-weight: bold; color: var(--a);}
 <div id="log" class="card" style="display:none"></div>
 
 <div id="res" class="card" style="display:none">
+<details><summary>Diagnostic Trace</summary><pre id="diag_out"></pre></details>
 <canvas id="cv" width="800" height="90"></canvas>
 <div class="row" style="margin-top:10px">
 <button id="play">&#9654; Play</button>
@@ -218,8 +238,9 @@ const $=id=>document.getElementById(id),LS=localStorage;
 });
 const AC=new(window.AudioContext||window.webkitAudioContext)();let cur=null,last={};
 let currentController = null;
+let diagnostics = { generation_id: "", stages: [] };
 
-async function llm(agent, system, user, temp = 0.6) {
+async function llm(agent, system, user, temp = 0.6, onRetry = null) {
   const key = $('key').value.trim();
   if (!key) throw new Error('Paste your API key first');
 
@@ -231,6 +252,7 @@ async function llm(agent, system, user, temp = 0.6) {
   
   while (attempts < maxRetries) {
     attempts++;
+    if(attempts > 1 && onRetry) onRetry(attempts);
     const startTime = Date.now();
     let timeoutCat = null, status = 0, elapsed = 0;
     
@@ -242,13 +264,13 @@ async function llm(agent, system, user, temp = 0.6) {
     const id = setTimeout(() => {
       timeoutCat = "READ_TIMEOUT";
       controller.abort();
-    }, readMs);
+    }, readMs + connectMs);
 
     try {
       const r = await fetch('/api/llm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key, messages: m, temperature: temp, connect_timeout: connectMs }),
+        body: JSON.stringify({ key, messages: m, temperature: temp, connect_timeout: connectMs, read_timeout: readMs, stage_name: agent }),
         signal: controller.signal
       });
       clearTimeout(id);
@@ -259,8 +281,10 @@ async function llm(agent, system, user, temp = 0.6) {
       if (!r.ok) {
         if ([502, 503, 504].includes(r.status)) {
            console.warn("LLM Error", {stage: agent, start_time: startTime, status, elapsed, retried: true, error: 'upstream_error'});
-           await new Promise(res => setTimeout(res, 500 + Math.random() * 500 * Math.pow(2, attempts)));
-           continue;
+           if (attempts < maxRetries) {
+               await new Promise(res => setTimeout(res, 500 + Math.random() * 500 * Math.pow(2, attempts)));
+               continue;
+           }
         }
         const err = await r.json();
         throw new Error(typeof err.error === 'string' ? err.error : JSON.stringify(err));
@@ -289,13 +313,15 @@ async function llm(agent, system, user, temp = 0.6) {
       
       if (errorName === "CANCELLED") throw new Error("[INFRASTRUCTURE] Cancelled by user");
 
-      if (errorName === "READ_TIMEOUT" || e.message.includes("CONNECT_TIMEOUT")) {
+      if (errorName === "READ_TIMEOUT" || e.message.includes("CONNECT_TIMEOUT") || e.message.includes("READ_TIMEOUT")) {
          if (attempts < maxRetries) {
              await new Promise(res => setTimeout(res, 500 + Math.random() * 500 * Math.pow(2, attempts)));
              continue;
          }
       }
-      throw new Error(`[INFRASTRUCTURE] ${agent} failed: ${errorName}`);
+      if (attempts >= maxRetries) {
+          throw new Error(`[INFRASTRUCTURE] ${agent} failed: ${errorName}`);
+      }
     }
   }
   throw new Error(`[INFRASTRUCTURE] ${agent} failed after ${maxRetries} retries`);
@@ -307,27 +333,52 @@ function showStatus(name, state, detail='') {
   let e = document.getElementById(id);
   if(!e){ e = document.createElement('div'); e.id = id; l.appendChild(e); }
   let cls = 'st';
-  let icon = '…';
+  let icon = '●';
   if(state === 'success') { icon = '✓'; }
   else if(state === 'error') { icon = '⚠'; cls += ' err'; }
   else if(state === 'warn') { icon = '⚠'; cls += ' warn'; }
+  else if(state === 'running' && !detail.includes('Retrying')) { icon = '●'; }
+  else if(state === 'running' && detail.includes('Retrying')) { icon = '↻'; }
   
   e.className = cls;
-  let htmlStr = `<div style="display:flex; justify-content:space-between; width:250px;"><b>${name}</b><span>${icon} ${detail}</span></div>`;
+  let htmlStr = `<div style="display:flex; justify-content:space-between; width:250px;"><b>${name}</b><span>${icon} ${detail.replace(/^[●✓⚠↻]\s*/,'')}</span></div>`;
   e.innerHTML = htmlStr;
 }
 
-async function stage(name, fn) {
-  showStatus(name, 'running');
+async function stage(name, fn, fallbackFn = null) {
+  showStatus(name, 'running', 'Processing');
+  const startTime = Date.now();
+  let attemptCount = 1;
+  let result = null;
+  let statusStr = "failed";
+  let errorClass = "unknown";
+  
   try {
-    const o = await fn();
+    const o = await fn((att) => { attemptCount = att; showStatus(name, 'running', 'Retrying ('+att+')'); });
     showStatus(name, 'success');
-    return o;
+    statusStr = "success";
+    result = o;
   } catch (e) {
-    const isInfra = e.message.includes("[INFRASTRUCTURE]");
-    showStatus(name, isInfra ? 'error' : 'warn', isInfra ? 'INFRA ERROR' : 'PIPELINE ERROR');
-    throw e;
+    errorClass = e.message;
+    if (fallbackFn) {
+      showStatus(name, 'warn', 'Degraded — fallback used');
+      statusStr = "degraded";
+      result = fallbackFn();
+    } else {
+      const isInfra = e.message.includes("[INFRASTRUCTURE]");
+      showStatus(name, isInfra ? 'error' : 'warn', isInfra ? 'INFRA ERROR' : 'PIPELINE ERROR');
+      diagnostics.stages.push({ name: name.toLowerCase(), status: "failed", duration_ms: Date.now() - startTime, attempt: attemptCount, error_class: errorClass });
+      throw e;
+    }
   }
+  diagnostics.stages.push({
+    name: name.toLowerCase(),
+    status: statusStr,
+    duration_ms: Date.now() - startTime,
+    attempt: attemptCount,
+    error_class: statusStr !== 'success' ? errorClass : undefined
+  });
+  return result;
 }
 
 async function feedback(preference, infraError=false) {
@@ -353,24 +404,22 @@ $('go').onclick=async()=>{
  const stageTimeoutMs = parseInt($('LLM_STAGE_TIMEOUT_MS').value);
 
  try{
+  diagnostics.generation_id = Math.random().toString(36).substring(2, 15);
   const prof=$('profile').value||'(none)';
   
   // 1. Refiner (Nonessential - Degrade gracefully)
-  let spec = null;
-  try {
-    spec = await stage('REFINER', ()=>llm('refiner', P.refiner, 'BRAND PROFILE:\n'+prof+'\n\nUSER REQUEST:\n'+p));
-  } catch (e) {
-    if (e.message.includes("[INFRASTRUCTURE]")) {
-      spec = { raw_intent: p, event_type: "compound", feeling_word: "unknown", degraded: true, source: "user_prompt", confidence: "low" };
-      showStatus('FALLBACK', 'warn', 'RAW PROMPT');
-    } else {
-      throw e;
-    }
-  }
+  const spec = await stage('REFINER', 
+    (onRetry)=>llm('refiner', P.refiner, 'BRAND PROFILE:\n'+prof+'\n\nUSER REQUEST:\n'+p, 0.6, onRetry),
+    () => ({ raw_intent: p, event_type: "compound", feeling_word: "unknown", degraded: true, source: "user_prompt", confidence: "low" })
+  );
   
-  // 2. Storyteller
-  const storyIn = JSON.stringify({perceptual_specification: spec, brand_profile: prof}); // Keeping context lean
-  const hyp = await stage('STORYTELLER', ()=>llm('storyteller', P.storyteller, storyIn));
+  // 2. Storyteller (Nonessential - Degrade gracefully, reduce context)
+  const leanSpec = { intent: spec.raw_intent, event_type: spec.event_type };
+  const storyIn = JSON.stringify({perceptual_specification: leanSpec, brand_profile: prof}); 
+  const hyp = await stage('STORYTELLER', 
+    (onRetry)=>llm('storyteller', P.storyteller, storyIn, 0.6, onRetry),
+    () => ({ fallback: true, intent: p, nodes: [], edges: [], degraded: true })
+  );
   $('hypothesis').textContent = JSON.stringify(hyp, null, 2);
 
   let iters = parseInt($('iters').value) || 1;
@@ -384,7 +433,7 @@ $('go').onclick=async()=>{
 
     // 4. Designer / Compiler
     const designIn = JSON.stringify({causal_hypothesis: hyp, previous_critique: critique});
-    const designOut = await stage('GRAPH', ()=>llm('designer', P.designer, designIn));
+    const designOut = await stage('GRAPH', (onRetry)=>llm('designer', P.designer, designIn, 0.6, onRetry));
     
     // 5. Python Compilation
     current_graph = designOut.graph;
@@ -415,6 +464,7 @@ $('go').onclick=async()=>{
   last = {prompt: p, spec: spec};
   
   $('res').style.display='block';
+  $('diag_out').textContent = JSON.stringify(diagnostics, null, 2);
   const cv=$('cv'),g=cv.getContext('2d'),d=cur.getChannelData(0);g.clearRect(0,0,800,90);g.strokeStyle='#00d9ff';g.beginPath();
   for(let x=0;x<800;x++){const s=Math.floor(x/800*d.length);let mx=0;for(let j=s;j<Math.min(d.length,s+Math.ceil(d.length/800));j++)mx=Math.max(mx,Math.abs(d[j]));g.moveTo(x,45-mx*42);g.lineTo(x,45+mx*42);}g.stroke();
   play(cur);
